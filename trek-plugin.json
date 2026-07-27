@@ -1,0 +1,22 @@
+{
+  "id": "trip-gallery",
+  "name": "Trip Gallery",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "author": "Radu Taraburca",
+  "description": "Shared photo gallery for your trip, with automatic HEIC conversion.",
+  "type": "trip-page",
+  "trek": ">=3.4.0 <4.0.0",
+  "nativeModules": false,
+  "permissions": [
+    "db:own",
+    "db:read:trips",
+    "db:read:files",
+    "db:read:files:content",
+    "db:write:files",
+    "ws:broadcast:trip"
+  ],
+  "requiredAddons": [],
+  "pluginDependencies": [],
+  "icon": "Images"
+}

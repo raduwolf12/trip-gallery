@@ -1,0 +1,5 @@
+{
+  "trips": {
+    "1": { "members": [1], "data": { "id": 1, "title": "Dev Trip" } }
+  }
+}

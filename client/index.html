@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trip Gallery</title>
+  <!-- trek:ui -->
+  <style>
+    html, body, #app { height: 100%; margin: 0; }
+    #app { display: flex; flex-direction: column; }
+    .content { flex: 1; overflow: auto; padding: 16px; }
+    .toolbar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border-faint);
+    }
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 10px; margin-top: 16px;
+    }
+    .tile {
+      position: relative; aspect-ratio: 1 / 1; border-radius: var(--radius-md, 12px);
+      overflow: hidden; background: var(--bg-hover); cursor: pointer;
+    }
+    .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .tile .skeleton { position: absolute; inset: 0; }
+    .empty { text-align: center; padding: 48px 16px; }
+    .empty svg { width: 48px; height: 48px; }
+    #fileInput { display: none; }
+    .lightbox {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 10; padding: 24px; flex-direction: column; gap: 12px;
+    }
+    .lightbox img { max-width: 100%; max-height: 65vh; border-radius: 8px; object-fit: contain; }
+    .lightbox .panel {
+      width: min(600px, 100%); display: flex; flex-direction: column; gap: 10px;
+    }
+    .lightbox .row { display: flex; gap: 8px; align-items: center; }
+    .lightbox .meta { color: #d4d4d8; font-size: 12px; }
+    .progress-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+    .progress-item { font-size: 12px; color: var(--text-muted); }
+    svg { width: 1em; height: 1em; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="toolbar">
+      <div class="trek-title">Gallery</div>
+      <div class="trek-cluster">
+        <span class="trek-chip trek-chip--accent" id="count">0 photos</span>
+        <button class="trek-btn trek-btn--primary" id="uploadBtn">Add photos</button>
+      </div>
+    </div>
+    <div class="content">
+      <div id="progress" class="progress-list"></div>
+      <div id="empty" class="empty" style="display:none">
+        <div class="trek-title">No photos yet</div>
+        <p class="trek-muted">Add photos from this trip — HEIC/HEIF from iPhones is converted automatically so everyone can view it.</p>
+      </div>
+      <div id="grid" class="grid"></div>
+    </div>
+  </div>
+  <input type="file" id="fileInput" accept="image/*,.heic,.heif" multiple />
+
+  <script src="./heic2any.min.js"></script>
+  <script>
+    (function () {
+      var tripId = null;
+      var photos = [];
+      var thumbCache = Object.create(null);
+      var refreshTimer = null;
+
+      var grid = document.getElementById('grid');
+      var emptyEl = document.getElementById('empty');
+      var countEl = document.getElementById('count');
+      var progressEl = document.getElementById('progress');
+      var fileInput = document.getElementById('fileInput');
+
+      trek.onContext(function (ctx) {
+        if (ctx.tripId && ctx.tripId !== tripId) {
+          tripId = ctx.tripId;
+          load();
+        }
+      });
+
+      trek.onEvent(function () {
+        scheduleRefresh();
+      });
+
+      function scheduleRefresh() {
+        if (refreshTimer) return;
+        refreshTimer = setTimeout(function () {
+          refreshTimer = null;
+          load();
+        }, 400);
+      }
+
+      document.getElementById('uploadBtn').addEventListener('click', function () {
+        fileInput.click();
+      });
+
+      fileInput.addEventListener('change', function () {
+        var files = Array.prototype.slice.call(fileInput.files || []);
+        fileInput.value = '';
+        if (files.length) uploadFiles(files);
+      });
+
+      async function load() {
+        if (!tripId) return;
+        try {
+          var data = await trek.invoke('/photos?tripId=' + encodeURIComponent(tripId));
+          photos = data.photos || [];
+          render();
+          loadThumbs();
+        } catch (e) {
+          trek.notify('error', 'Could not load photos: ' + e.message);
+        }
+      }
+
+      function render() {
+        countEl.textContent = photos.length + (photos.length === 1 ? ' photo' : ' photos');
+        emptyEl.style.display = photos.length ? 'none' : 'block';
+        grid.innerHTML = '';
+        photos.forEach(function (p) {
+          var tile = document.createElement('div');
+          tile.className = 'tile';
+          tile.dataset.id = p.id;
+          var cached = thumbCache[p.thumbFileId];
+          if (cached) {
+            var img = document.createElement('img');
+            img.src = cached;
+            img.loading = 'lazy';
+            tile.appendChild(img);
+          } else {
+            var sk = document.createElement('div');
+            sk.className = 'skeleton trek-skeleton';
+            tile.appendChild(sk);
+          }
+          tile.addEventListener('click', function () {
+            openLightbox(p);
+          });
+          grid.appendChild(tile);
+        });
+      }
+
+      async function loadThumbs() {
+        var need = photos.filter(function (p) { return !thumbCache[p.thumbFileId]; });
+        var chunkSize = 12;
+        for (var i = 0; i < need.length; i += chunkSize) {
+          var chunk = need.slice(i, i + chunkSize);
+          try {
+            var res = await trek.invoke('/photos/content', {
+              method: 'POST',
+              body: { tripId: tripId, fileIds: chunk.map(function (p) { return p.thumbFileId; }) },
+            });
+            Object.keys(res.files || {}).forEach(function (fid) {
+              var f = res.files[fid];
+              thumbCache[fid] = 'data:' + (f.mimetype || 'image/jpeg') + ';base64,' + f.contentBase64;
+            });
+            render();
+          } catch (e) {
+            // best-effort; leave skeletons for the ones that failed
+          }
+        }
+      }
+
+      async function fetchFull(fileId) {
+        var res = await trek.invoke('/photos/content', {
+          method: 'POST',
+          body: { tripId: tripId, fileIds: [fileId] },
+        });
+        var f = res.files && res.files[fileId];
+        if (!f) throw new Error('image unavailable');
+        return 'data:' + (f.mimetype || 'image/jpeg') + ';base64,' + f.contentBase64;
+      }
+
+      function openLightbox(photo) {
+        var overlay = document.createElement('div');
+        overlay.className = 'lightbox';
+        var img = document.createElement('img');
+        img.alt = '';
+        overlay.appendChild(img);
+
+        var panel = document.createElement('div');
+        panel.className = 'panel';
+
+        var meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = (photo.uploadedByName ? 'Added by ' + photo.uploadedByName : 'Added') +
+          (photo.createdAt ? ' · ' + new Date(photo.createdAt).toLocaleString() : '');
+        panel.appendChild(meta);
+
+        var row = document.createElement('div');
+        row.className = 'row';
+        var caption = document.createElement('input');
+        caption.className = 'trek-input';
+        caption.style.flex = '1';
+        caption.placeholder = 'Add a caption…';
+        caption.value = photo.caption || '';
+        row.appendChild(caption);
+
+        var saveBtn = document.createElement('button');
+        saveBtn.className = 'trek-btn trek-btn--secondary';
+        saveBtn.textContent = 'Save';
+        saveBtn.addEventListener('click', async function () {
+          try {
+            await trek.invoke('/photos/caption', {
+              method: 'POST',
+              body: { tripId: tripId, photoId: photo.id, caption: caption.value },
+            });
+            photo.caption = caption.value;
+            trek.notify('success', 'Caption saved');
+          } catch (e) {
+            trek.notify('error', e.message);
+          }
+        });
+        row.appendChild(saveBtn);
+        panel.appendChild(row);
+
+        var actions = document.createElement('div');
+        actions.className = 'row';
+
+        var deleteBtn = document.createElement('button');
+        deleteBtn.className = 'trek-btn trek-btn--danger';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.addEventListener('click', async function () {
+          var confirmed = await trek.confirm({
+            title: 'Delete photo',
+            message: 'This removes the photo for everyone on this trip. This cannot be undone.',
+            confirmLabel: 'Delete',
+            danger: true,
+          });
+          if (!confirmed) return;
+          try {
+            await trek.invoke('/photos/delete', {
+              method: 'POST',
+              body: { tripId: tripId, photoId: photo.id },
+            });
+            close();
+            load();
+          } catch (e) {
+            trek.notify('error', e.message);
+          }
+        });
+        actions.appendChild(deleteBtn);
+
+        var closeBtn = document.createElement('button');
+        closeBtn.className = 'trek-btn trek-btn--secondary';
+        closeBtn.textContent = 'Close';
+        closeBtn.addEventListener('click', close);
+        actions.appendChild(closeBtn);
+        panel.appendChild(actions);
+
+        overlay.appendChild(panel);
+
+        function close() {
+          overlay.remove();
+          document.removeEventListener('keydown', onKey);
+        }
+        function onKey(e) {
+          if (e.key === 'Escape') close();
+        }
+        document.addEventListener('keydown', onKey);
+        overlay.addEventListener('click', function (e) {
+          if (e.target === overlay) close();
+        });
+
+        document.body.appendChild(overlay);
+        fetchFull(photo.fullFileId)
+          .then(function (src) { img.src = src; })
+          .catch(function (e) { trek.notify('error', e.message); close(); });
+      }
+
+      // ---- Upload pipeline: HEIC/HEIF -> JPEG, downscale, thumbnail ----
+
+      function isHeic(file) {
+        var name = (file.name || '').toLowerCase();
+        var type = (file.type || '').toLowerCase();
+        return name.endsWith('.heic') || name.endsWith('.heif') ||
+          type === 'image/heic' || type === 'image/heif';
+      }
+
+      async function toJpegBlob(file) {
+        if (isHeic(file)) {
+          var converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 });
+          return Array.isArray(converted) ? converted[0] : converted;
+        }
+        return file;
+      }
+
+      async function loadBitmap(blob) {
+        if (window.createImageBitmap) {
+          try {
+            return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+          } catch (e) {
+            // fall through to <img> path below
+          }
+        }
+        var url = URL.createObjectURL(blob);
+        try {
+          return await new Promise(function (resolve, reject) {
+            var img = new Image();
+            img.onload = function () { resolve(img); };
+            img.onerror = reject;
+            img.src = url;
+          });
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+
+      function resizeToBlob(bitmap, maxDim, quality) {
+        var w = bitmap.width, h = bitmap.height;
+        var scale = Math.min(1, maxDim / Math.max(w, h));
+        var outW = Math.max(1, Math.round(w * scale));
+        var outH = Math.max(1, Math.round(h * scale));
+        var canvas = document.createElement('canvas');
+        canvas.width = outW;
+        canvas.height = outH;
+        var c = canvas.getContext('2d');
+        c.drawImage(bitmap, 0, 0, outW, outH);
+        return new Promise(function (resolve) {
+          canvas.toBlob(function (blob) { resolve({ blob: blob, width: outW, height: outH }); }, 'image/jpeg', quality);
+        });
+      }
+
+      function blobToBase64(blob) {
+        return new Promise(function (resolve, reject) {
+          var reader = new FileReader();
+          reader.onload = function () {
+            var result = reader.result;
+            resolve(result.slice(result.indexOf(',') + 1));
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      function addProgress(label) {
+        var row = document.createElement('div');
+        row.className = 'progress-item';
+        row.textContent = label;
+        progressEl.appendChild(row);
+        return row;
+      }
+
+      async function uploadOne(file, row) {
+        row.textContent = 'Converting ' + file.name + '…';
+        var jpegBlob = await toJpegBlob(file);
+        var bitmap = await loadBitmap(jpegBlob);
+
+        row.textContent = 'Preparing ' + file.name + '…';
+        var full = await resizeToBlob(bitmap, 2200, 0.85);
+        var thumb = await resizeToBlob(bitmap, 480, 0.75);
+
+        var fullBase64 = await blobToBase64(full.blob);
+        var thumbBase64 = await blobToBase64(thumb.blob);
+
+        row.textContent = 'Uploading ' + file.name + '…';
+        await trek.invoke('/photos', {
+          method: 'POST',
+          body: {
+            tripId: tripId,
+            filename: file.name,
+            fullBase64: fullBase64,
+            thumbBase64: thumbBase64,
+            width: full.width,
+            height: full.height,
+          },
+        });
+        row.textContent = file.name + ' — done';
+        setTimeout(function () { row.remove(); }, 1500);
+      }
+
+      async function uploadFiles(files) {
+        if (!tripId) return;
+        var rows = files.map(function (f) { return addProgress('Queued ' + f.name); });
+        for (var i = 0; i < files.length; i++) {
+          try {
+            await uploadOne(files[i], rows[i]);
+          } catch (e) {
+            rows[i].textContent = files[i].name + ' failed: ' + e.message;
+          }
+        }
+        load();
+      }
+    })();
+  </script>
+</body>
+</html>

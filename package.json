@@ -1,0 +1,16 @@
+{
+  "name": "trip-gallery",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "trek-plugin-sdk dev .",
+    "pack": "npx -y trek-plugin-sdk pack",
+    "shot": "node scripts/shot.mjs",
+    "preview-shot": "node scripts/shot.mjs --preview"
+  },
+  "devDependencies": {
+    "playwright": "latest",
+    "trek-plugin-sdk": "latest"
+  }
+}
