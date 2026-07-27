@@ -45,6 +45,7 @@ looks best (the card crops the edges).
 | `db:read:files:content` | Reads back the stored thumbnail/full-image bytes so the gallery grid and lightbox can display them. |
 | `db:write:files` | Stores each converted photo (and its thumbnail) as a trip file, and removes them when a photo is deleted. |
 | `ws:broadcast:trip` | Notifies everyone else viewing the trip when a photo is added, edited, or removed, so the gallery refreshes live. |
+| `events:subscribe` | Listens for `file:deleted` so removing a photo from the trip's Files tab also removes it from the gallery. |
 
 ## Setup
 

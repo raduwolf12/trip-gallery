@@ -31,7 +31,27 @@
       display: flex; align-items: center; justify-content: center;
       z-index: 10; padding: 24px; flex-direction: column; gap: 12px;
     }
-    .lightbox img { max-width: 100%; max-height: 65vh; border-radius: 8px; object-fit: contain; }
+    .lightbox .stage {
+      position: relative; display: flex; align-items: center; justify-content: center;
+      width: 100%; max-height: 65vh;
+    }
+    .lightbox img {
+      max-width: 100%; max-height: 65vh; border-radius: 8px; object-fit: contain;
+      opacity: 0; transition: opacity 0.15s ease;
+    }
+    .lightbox img.loaded { opacity: 1; }
+    .lightbox .nav {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      width: 44px; height: 44px; border-radius: 50%; border: none;
+      background: rgba(0,0,0,0.5); color: #fff; font-size: 20px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s ease;
+    }
+    .lightbox .nav:hover { background: rgba(0,0,0,0.75); }
+    .lightbox .nav:disabled { opacity: 0.3; cursor: default; pointer-events: none; }
+    .lightbox .nav--prev { left: 8px; }
+    .lightbox .nav--next { right: 8px; }
+    .lightbox .counter { color: #d4d4d8; font-size: 12px; }
     .lightbox .panel {
       width: min(600px, 100%); display: flex; flex-direction: column; gap: 10px;
     }
@@ -68,7 +88,9 @@
       var tripId = null;
       var photos = [];
       var thumbCache = Object.create(null);
+      var fullCache = Object.create(null);
       var refreshTimer = null;
+      var uploading = false;
 
       var grid = document.getElementById('grid');
       var emptyEl = document.getElementById('empty');
@@ -88,6 +110,9 @@
       });
 
       function scheduleRefresh() {
+        // Uploading already ends with its own load(); avoid stacking extra concurrent
+        // GET /photos + thumbnail-refetch traffic on top of an in-flight upload batch.
+        if (uploading) return;
         if (refreshTimer) return;
         refreshTimer = setTimeout(function () {
           refreshTimer = null;
@@ -121,7 +146,7 @@
         countEl.textContent = photos.length + (photos.length === 1 ? ' photo' : ' photos');
         emptyEl.style.display = photos.length ? 'none' : 'block';
         grid.innerHTML = '';
-        photos.forEach(function (p) {
+        photos.forEach(function (p, index) {
           var tile = document.createElement('div');
           tile.className = 'tile';
           tile.dataset.id = p.id;
@@ -137,7 +162,7 @@
             tile.appendChild(sk);
           }
           tile.addEventListener('click', function () {
-            openLightbox(p);
+            openLightbox(index);
           });
           grid.appendChild(tile);
         });
@@ -165,29 +190,54 @@
       }
 
       async function fetchFull(fileId) {
+        if (fullCache[fileId]) return fullCache[fileId];
         var res = await trek.invoke('/photos/content', {
           method: 'POST',
           body: { tripId: tripId, fileIds: [fileId] },
         });
         var f = res.files && res.files[fileId];
         if (!f) throw new Error('image unavailable');
-        return 'data:' + (f.mimetype || 'image/jpeg') + ';base64,' + f.contentBase64;
+        var src = 'data:' + (f.mimetype || 'image/jpeg') + ';base64,' + f.contentBase64;
+        fullCache[fileId] = src;
+        return src;
       }
 
-      function openLightbox(photo) {
+      function openLightbox(index) {
         var overlay = document.createElement('div');
         overlay.className = 'lightbox';
+
+        var stage = document.createElement('div');
+        stage.className = 'stage';
+
+        var prevBtn = document.createElement('button');
+        prevBtn.className = 'nav nav--prev';
+        prevBtn.setAttribute('aria-label', 'Previous photo');
+        prevBtn.textContent = '‹';
+        prevBtn.addEventListener('click', function (e) { e.stopPropagation(); show(index - 1); });
+        stage.appendChild(prevBtn);
+
         var img = document.createElement('img');
         img.alt = '';
-        overlay.appendChild(img);
+        stage.appendChild(img);
+
+        var nextBtn = document.createElement('button');
+        nextBtn.className = 'nav nav--next';
+        nextBtn.setAttribute('aria-label', 'Next photo');
+        nextBtn.textContent = '›';
+        nextBtn.addEventListener('click', function (e) { e.stopPropagation(); show(index + 1); });
+        stage.appendChild(nextBtn);
+
+        overlay.appendChild(stage);
+
+        var counter = document.createElement('div');
+        counter.className = 'counter';
+        overlay.appendChild(counter);
 
         var panel = document.createElement('div');
         panel.className = 'panel';
 
         var meta = document.createElement('div');
         meta.className = 'meta';
-        meta.textContent = (photo.uploadedByName ? 'Added by ' + photo.uploadedByName : 'Added') +
-          (photo.createdAt ? ' · ' + new Date(photo.createdAt).toLocaleString() : '');
         panel.appendChild(meta);
 
         var row = document.createElement('div');
@@ -196,24 +246,11 @@
         caption.className = 'trek-input';
         caption.style.flex = '1';
         caption.placeholder = 'Add a caption…';
-        caption.value = photo.caption || '';
         row.appendChild(caption);
 
         var saveBtn = document.createElement('button');
         saveBtn.className = 'trek-btn trek-btn--secondary';
         saveBtn.textContent = 'Save';
-        saveBtn.addEventListener('click', async function () {
-          try {
-            await trek.invoke('/photos/caption', {
-              method: 'POST',
-              body: { tripId: tripId, photoId: photo.id, caption: caption.value },
-            });
-            photo.caption = caption.value;
-            trek.notify('success', 'Caption saved');
-          } catch (e) {
-            trek.notify('error', e.message);
-          }
-        });
         row.appendChild(saveBtn);
         panel.appendChild(row);
 
@@ -223,25 +260,6 @@
         var deleteBtn = document.createElement('button');
         deleteBtn.className = 'trek-btn trek-btn--danger';
         deleteBtn.textContent = 'Delete';
-        deleteBtn.addEventListener('click', async function () {
-          var confirmed = await trek.confirm({
-            title: 'Delete photo',
-            message: 'This removes the photo for everyone on this trip. This cannot be undone.',
-            confirmLabel: 'Delete',
-            danger: true,
-          });
-          if (!confirmed) return;
-          try {
-            await trek.invoke('/photos/delete', {
-              method: 'POST',
-              body: { tripId: tripId, photoId: photo.id },
-            });
-            close();
-            load();
-          } catch (e) {
-            trek.notify('error', e.message);
-          }
-        });
         actions.appendChild(deleteBtn);
 
         var closeBtn = document.createElement('button');
@@ -259,16 +277,89 @@
         }
         function onKey(e) {
           if (e.key === 'Escape') close();
+          else if (e.key === 'ArrowLeft') show(index - 1);
+          else if (e.key === 'ArrowRight') show(index + 1);
         }
         document.addEventListener('keydown', onKey);
         overlay.addEventListener('click', function (e) {
           if (e.target === overlay) close();
         });
 
+        function prefetch(i) {
+          var p = photos[i];
+          if (p) fetchFull(p.fullFileId).catch(function () {});
+        }
+
+        function show(i) {
+          if (i < 0 || i >= photos.length) return;
+          index = i;
+          var photo = photos[index];
+
+          prevBtn.disabled = index === 0;
+          nextBtn.disabled = index === photos.length - 1;
+          counter.textContent = (index + 1) + ' / ' + photos.length;
+
+          meta.textContent = (photo.uploadedByName ? 'Added by ' + photo.uploadedByName : 'Added') +
+            (photo.createdAt ? ' · ' + new Date(photo.createdAt).toLocaleString() : '');
+          caption.value = photo.caption || '';
+
+          saveBtn.onclick = async function () {
+            try {
+              await trek.invoke('/photos/caption', {
+                method: 'POST',
+                body: { tripId: tripId, photoId: photo.id, caption: caption.value },
+              });
+              photo.caption = caption.value;
+              trek.notify('success', 'Caption saved');
+            } catch (e) {
+              trek.notify('error', e.message);
+            }
+          };
+
+          deleteBtn.onclick = async function () {
+            var confirmed = await trek.confirm({
+              title: 'Delete photo',
+              message: 'This removes the photo for everyone on this trip. This cannot be undone.',
+              confirmLabel: 'Delete',
+              danger: true,
+            });
+            if (!confirmed) return;
+            try {
+              await trek.invoke('/photos/delete', {
+                method: 'POST',
+                body: { tripId: tripId, photoId: photo.id },
+              });
+              close();
+              load();
+            } catch (e) {
+              trek.notify('error', e.message);
+            }
+          };
+
+          var cachedThumb = thumbCache[photo.thumbFileId];
+          if (cachedThumb) {
+            img.src = cachedThumb;
+            img.classList.add('loaded');
+          } else {
+            img.classList.remove('loaded');
+          }
+          fetchFull(photo.fullFileId)
+            .then(function (src) {
+              if (photos[index] !== photo) return;
+              img.src = src;
+              img.classList.add('loaded');
+            })
+            .catch(function (e) {
+              trek.notify('error', e.message);
+              close();
+            });
+
+          prefetch(index - 1);
+          prefetch(index + 1);
+        }
+
         document.body.appendChild(overlay);
-        fetchFull(photo.fullFileId)
-          .then(function (src) { img.src = src; })
-          .catch(function (e) { trek.notify('error', e.message); close(); });
+        show(index);
       }
 
       // ---- Upload pipeline: HEIC/HEIF -> JPEG, downscale, thumbnail ----
@@ -344,26 +435,82 @@
         return row;
       }
 
+      // The host applies a global express.json({limit:'100kb'}) to every plugin route body,
+      // so each request (including JSON overhead) must stay well under 100KB. capBytes gates
+      // the actual base64 STRING length that goes over the wire (not the ~25%-smaller decoded
+      // byte count), with margin left for the surrounding JSON.
+      var UPLOAD_CAP_BYTES = 90 * 1024;
+
+      // Compresses in progressively smaller passes until the base64 payload fits under
+      // capBytes, instead of compressing once at a fixed size and failing outright. The
+      // last passes are aggressive on purpose — a small, blurry photo beats none at all.
+      var FULL_PASSES = [
+        [2200, 0.85], [1600, 0.75], [1200, 0.7], [900, 0.6],
+        [700, 0.5], [500, 0.4], [350, 0.35], [250, 0.3],
+      ];
+      var THUMB_PASSES = [
+        [480, 0.75], [400, 0.65], [320, 0.55], [250, 0.45], [180, 0.4],
+      ];
+
+      async function resizeUnderCap(bitmap, capBytes, passes) {
+        for (var i = 0; i < passes.length; i++) {
+          var result = await resizeToBlob(bitmap, passes[i][0], passes[i][1]);
+          var base64 = await blobToBase64(result.blob);
+          if (base64.length <= capBytes || i === passes.length - 1) {
+            return { width: result.width, height: result.height, base64: base64 };
+          }
+        }
+      }
+
+      function sleep(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+      }
+
+      // Retries transient gateway/rate-limit failures (502/503/504/429) with backoff.
+      // A 4xx other than 429 is a real client error (bad payload, no access) — fail fast.
+      async function invokeWithRetry(path, opts) {
+        var attempts = 4;
+        for (var i = 0; i < attempts; i++) {
+          try {
+            return await trek.invoke(path, opts);
+          } catch (e) {
+            var status = e.status || e.code;
+            var transient = status === 502 || status === 503 || status === 504 || status === 429;
+            if (!transient || i === attempts - 1) throw e;
+            await sleep(500 * Math.pow(2, i));
+          }
+        }
+      }
+
+      async function uploadImage(base64, filename) {
+        var res = await invokeWithRetry('/photos/upload-image', {
+          method: 'POST',
+          body: { tripId: tripId, filename: filename, base64: base64 },
+        });
+        return res.fileId;
+      }
+
       async function uploadOne(file, row) {
         row.textContent = 'Converting ' + file.name + '…';
         var jpegBlob = await toJpegBlob(file);
         var bitmap = await loadBitmap(jpegBlob);
 
         row.textContent = 'Preparing ' + file.name + '…';
-        var full = await resizeToBlob(bitmap, 2200, 0.85);
-        var thumb = await resizeToBlob(bitmap, 480, 0.75);
+        var full = await resizeUnderCap(bitmap, UPLOAD_CAP_BYTES, FULL_PASSES);
+        var thumb = await resizeUnderCap(bitmap, UPLOAD_CAP_BYTES, THUMB_PASSES);
 
-        var fullBase64 = await blobToBase64(full.blob);
-        var thumbBase64 = await blobToBase64(thumb.blob);
+        var baseName = file.name.replace(/\.[a-z0-9]+$/i, '').slice(0, 100) || 'photo';
 
         row.textContent = 'Uploading ' + file.name + '…';
-        await trek.invoke('/photos', {
+        var fullFileId = await uploadImage(full.base64, baseName + '.jpg');
+        var thumbFileId = await uploadImage(thumb.base64, baseName + '-thumb.jpg');
+
+        await invokeWithRetry('/photos', {
           method: 'POST',
           body: {
             tripId: tripId,
-            filename: file.name,
-            fullBase64: fullBase64,
-            thumbBase64: thumbBase64,
+            fullFileId: fullFileId,
+            thumbFileId: thumbFileId,
             width: full.width,
             height: full.height,
           },
@@ -375,12 +522,21 @@
       async function uploadFiles(files) {
         if (!tripId) return;
         var rows = files.map(function (f) { return addProgress('Queued ' + f.name); });
-        for (var i = 0; i < files.length; i++) {
-          try {
-            await uploadOne(files[i], rows[i]);
-          } catch (e) {
-            rows[i].textContent = files[i].name + ' failed: ' + e.message;
+        uploading = true;
+        try {
+          for (var i = 0; i < files.length; i++) {
+            try {
+              await uploadOne(files[i], rows[i]);
+            } catch (e) {
+              var status = e.status || e.code;
+              rows[i].textContent = files[i].name + ' failed: ' + e.message + (status ? ' (' + status + ')' : '');
+            }
+            // Small pacing gap between files so a big batch doesn't hammer the host
+            // with back-to-back requests.
+            if (i < files.length - 1) await sleep(250);
           }
+        } finally {
+          uploading = false;
         }
         load();
       }

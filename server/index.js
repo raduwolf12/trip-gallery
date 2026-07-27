@@ -49,6 +49,26 @@ module.exports = definePlugin({
     ctx.log.info('trip-gallery loaded');
   },
 
+  events: [
+    {
+      // Keeps the gallery in sync when a photo is removed from the trip's Files
+      // tab directly (rather than from this gallery's own delete button) — drop
+      // whichever photo row referenced it as its full or thumb file. Event
+      // handlers run userless (no ctx.trips/files/ws here), so this only touches
+      // our own db:own table.
+      on: 'file:deleted',
+      async handler({ tripId, entityId }, ctx) {
+        if (!tripId || !entityId) return;
+        await ctx.db.exec(
+          'DELETE FROM photos WHERE trip_id = ? AND (full_file_id = ? OR thumb_file_id = ?)',
+          tripId,
+          entityId,
+          entityId
+        );
+      },
+    },
+  ],
+
   routes: [
     {
       method: 'GET',
@@ -66,7 +86,56 @@ module.exports = definePlugin({
           'SELECT * FROM photos WHERE trip_id = ? ORDER BY id DESC',
           tripId
         );
-        return ok({ photos: rows.map(toDto) });
+
+        // Self-heal rows left over from files deleted before this plugin subscribed to
+        // file:deleted (or from any other way the underlying file could have gone away) —
+        // ctx.files.list excludes trash, so anything not in it is gone. Without this the
+        // client keeps retrying a fetch that can never succeed.
+        const live = new Set((await ctx.files.list(tripId)).map((f) => f.id));
+        const good = [];
+        const staleIds = [];
+        for (const row of rows) {
+          if (live.has(row.full_file_id) && live.has(row.thumb_file_id)) good.push(row);
+          else staleIds.push(row.id);
+        }
+        if (staleIds.length) {
+          const placeholders = staleIds.map(() => '?').join(',');
+          await ctx.db.exec(`DELETE FROM photos WHERE id IN (${placeholders})`, ...staleIds);
+        }
+
+        return ok({ photos: good.map(toDto) });
+      },
+    },
+    {
+      // Uploads a single image chunk (either the full-res photo or its thumbnail) and
+      // returns the stored file's id. The host applies a small (~100kb) body-size limit
+      // to every plugin route, so a photo's full image and thumbnail must be sent as two
+      // separate requests rather than bundled into one — see /photos below, which only
+      // ever receives the two resulting fileIds plus small metadata.
+      method: 'POST',
+      path: '/photos/upload-image',
+      auth: true,
+      async handler(req, ctx) {
+        const b = req.body || {};
+        const tripId = Number(b.tripId);
+        if (!tripId) return bad(400, 'tripId is required');
+        if (!b.base64 || !b.filename) return bad(400, 'filename and base64 are required');
+        try {
+          await requireTripAccess(ctx, tripId);
+        } catch (e) {
+          return bad(e.status || 403, e.message);
+        }
+
+        try {
+          const file = await ctx.files.create(tripId, {
+            name: String(b.filename).slice(0, 150),
+            mimetype: 'image/jpeg',
+            content_base64: b.base64,
+          });
+          return ok({ fileId: file.id });
+        } catch (e) {
+          return bad(400, 'could not store image: ' + e.message);
+        }
       },
     },
     {
@@ -76,30 +145,14 @@ module.exports = definePlugin({
       async handler(req, ctx) {
         const b = req.body || {};
         const tripId = Number(b.tripId);
+        const fullFileId = Number(b.fullFileId);
+        const thumbFileId = Number(b.thumbFileId);
         if (!tripId) return bad(400, 'tripId is required');
-        if (!b.fullBase64 || !b.thumbBase64) return bad(400, 'missing image data');
+        if (!fullFileId || !thumbFileId) return bad(400, 'fullFileId and thumbFileId are required');
         try {
           await requireTripAccess(ctx, tripId);
         } catch (e) {
           return bad(e.status || 403, e.message);
-        }
-
-        const baseName = String(b.filename || 'photo').replace(/\.[a-z0-9]+$/i, '').slice(0, 100) || 'photo';
-
-        let full, thumb;
-        try {
-          full = await ctx.files.create(tripId, {
-            name: baseName + '.jpg',
-            mimetype: 'image/jpeg',
-            content_base64: b.fullBase64,
-          });
-          thumb = await ctx.files.create(tripId, {
-            name: baseName + '-thumb.jpg',
-            mimetype: 'image/jpeg',
-            content_base64: b.thumbBase64,
-          });
-        } catch (e) {
-          return bad(400, 'could not store photo: ' + e.message);
         }
 
         const createdAt = new Date().toISOString();
@@ -108,8 +161,8 @@ module.exports = definePlugin({
             (trip_id, full_file_id, thumb_file_id, caption, uploaded_by, uploaded_by_name, width, height, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           tripId,
-          full.id,
-          thumb.id,
+          fullFileId,
+          thumbFileId,
           b.caption ? String(b.caption).slice(0, 500) : null,
           req.user ? req.user.id : null,
           req.user ? req.user.username : null,
